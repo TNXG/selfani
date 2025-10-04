@@ -2,8 +2,10 @@
 
 # 预留的 API 配置（暂时留空，后续使用）
 [api]
-# base_url = ""
-# token = ""
+bind = "127.0.0.1:8080"
+public_base = "http://127.0.0.1:8080"
+enable_cache = true
+cache_dir = "cache"
 
 # 存储配置：用于组织文件保存目录/文件名
 [storage]

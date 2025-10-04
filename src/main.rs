@@ -1,373 +1,416 @@
-use anyhow::{anyhow, Result};
-use std::path::Path;
-
-mod cookies;
 mod config;
-mod download;
-mod login;
+mod cookies;
 mod playurl;
-mod resolve;
-mod select;
+mod search;
 mod wbi;
-mod term;
-mod mux;
-mod cover;
+mod hls;
 
-fn print_usage() {
-    eprintln!(
-        "用法:\n  selfani login                      扫码登录并保存 cookies.json\n  selfani message <id|url>          展示解析到的标题/分P/EP 简要信息\n  selfani search <id|url> [--ep N]  选出最佳音视频并输出 URL（调试用）\n  selfani download <id|url> [--ep N] 解析输入，自动选流并下载音视频（合流提示）\n  selfani stream <id|url> [--ep N]  直接通过 ffmpeg 流式合流为 MP4（不落盘 m4s）\n\n参数:\n  --ep N    指定番剧集数（从 1 开始）"
-    );
+use actix_web::{App, HttpResponse, HttpServer, Responder, get, web};
+use actix_web::middleware::Logger as ActixLogger;
+use actix_cors::Cors;
+use anyhow::{Context, Result};
+use reqwest::Client;
+use serde::Serialize;
+use serde_json::Value;
+
+#[derive(Serialize)]
+pub struct ApiResult<T> {
+    code: i32, // 0 成功；其他为错误码（本地或上游）
+    success: bool,
+    message: String, // 错误描述或空
+    data: T,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let mut args = std::env::args().skip(1).collect::<Vec<_>>();
-    if args.is_empty() {
-        print_usage();
-        return Ok(());
+#[derive(Serialize)]
+struct SearchItem {
+    id: String,
+    title: String,
+    cover: String,
+    description: String,
+    year: String,
+    status: String,
+    #[serde(rename = "type")]
+    type_field: String,
+    url: String,
+}
+
+#[derive(Serialize)]
+struct DetailSourceItem {
+    name: String,
+    sort: usize,
+    url: String,
+}
+
+#[derive(Serialize)]
+struct DetailData {
+    id: String,
+    title: String,
+    cover: String,
+    description: String,
+    year: String,
+    status: String,
+    #[serde(rename = "type")]
+    type_field: String,
+    sources: Vec<DetailSourceItem>,
+}
+
+#[get("/search")]
+async fn search_endpoint(
+    q: web::Query<std::collections::HashMap<String, String>>,
+    data: web::Data<AppState>,
+) -> impl Responder {
+    let keyword = q.get("q").map(|s| s.trim()).filter(|s| !s.is_empty());
+    if keyword.is_none() {
+        return HttpResponse::BadRequest().json(ApiResult {
+            code: 400,
+            success: false,
+            message: "缺少 q 参数".to_string(),
+            data: Vec::<SearchItem>::new(),
+        });
     }
-
-    // 初始化 HTTP 客户端和 Cookie
-    let store = cookies::load_cookie_store()?;
-    let is_logged_in = cookies::is_logged_in(&store);
-    let (client, cookie_mutex) = cookies::build_client(store)?;
-
-    match args.remove(0).as_str() {
-        "login" => {
-            login::login_qr(&client).await?;
-            let guard = cookie_mutex.lock().unwrap();
-            cookies::save_cookie_store(&*guard)?;
-        }
-        "message" => {
-            if args.is_empty() {
-                return Err(anyhow!("缺少 <id|url>"));
-            }
-            match resolve::resolve_input(&client, &args[0]).await? {
-                resolve::Resolved::Pub { cid, bvid, title, .. } => {
-                    println!("{} {}", term::paint("类型:", term::Style::Label), term::paint("UGC 视频", term::Style::Title));
-                    println!("{} {}", term::paint("标题:", term::Style::Label), title);
-                    println!("{} {}", term::paint("BV号:", term::Style::Label), bvid);
-                    println!("{} {}", term::paint("CID:", term::Style::Label), cid);
-                }
-                resolve::Resolved::Pgc { ep_id, season_id, season_title, evaluate, episodes, title: _title, .. } => {
-                    println!("{} {}", term::paint("类型:", term::Style::Label), term::paint("番剧", term::Style::Title));
-                    println!("{} {}", term::paint("标题:", term::Style::Label), season_title);
-                    println!("{} {}", term::paint("Season ID:", term::Style::Label), season_id);
-                    if !evaluate.is_empty() {
-                        println!("\n{}\n  {}", term::paint("简介:", term::Style::Label), evaluate);
-                    }
-
-                    // 找出当前选中的集数
-                    let current_ep_index = if ep_id != 0 {
-                        episodes.iter().position(|e| e.ep_id == Some(ep_id))
-                    } else {
-                        None
-                    };
-
-                    println!("\n{} {}", term::paint("共", term::Style::Label), episodes.len());
-                    for (idx, ep) in episodes.iter().enumerate() {
-                        let ep_title = ep.long_title.as_ref()
-                            .or(ep.title.as_ref())
-                            .map(|s| s.as_str())
-                            .unwrap_or("未知标题");
-                        let short_title = ep.title.as_ref().map(|s| s.as_str()).unwrap_or("");
-                        let marker = if Some(idx) == current_ep_index { " ← 当前" } else { "" };
-                        println!("  [{}] ep{} {} - {}{}",
-                            idx + 1,
-                            ep.ep_id.unwrap_or(0),
-                            short_title,
-                            ep_title,
-                            marker
-                        );
-                    }
-
-                    println!("\n{} 请使用 'search' 或 'download' 命令并携带 --ep N 参数指定要操作的集数（N 从 1 开始）", term::paint("提示:", term::Style::Info));
-                }
-            }
-        }
-        "search" => {
-            if args.is_empty() {
-                return Err(anyhow!("缺少 <id|url>"));
-            }
-
-            // 解析 --ep 参数（用户输入从 1 开始，需要转换为从 0 开始的索引）
-            let ep_index = args.iter().position(|s| s == "--ep")
-                .and_then(|pos| args.get(pos + 1))
-                .and_then(|s| s.parse::<usize>().ok())
-                .and_then(|n| n.checked_sub(1));
-
-            let input = &args[0];
-            let resolved = resolve::resolve_input_with_ep(&client, input, ep_index).await?;
-
-            // 检查是否为未指定集数的番剧
-            if let resolve::Resolved::Pgc { ep_id: 0, season_title, episodes, .. } = &resolved {
-                println!("错误: 番剧 '{}' 需要指定集数", season_title);
-                println!("共 {} 集，请使用 --ep N 参数指定（N 从 1 开始）", episodes.len());
-                return Ok(());
-            }
-
-            // 显示当前选择的内容信息
-            match &resolved {
-                resolve::Resolved::Pub { bvid, title, .. } => {
-                    println!("{} {} ({})\n", term::paint("视频:", term::Style::Label), title, term::paint(bvid, term::Style::Dim));
-                }
-                resolve::Resolved::Pgc { season_title, title, ep_id, episodes, .. } => {
-                    // 找到当前集的索引
-                    if let Some(idx) = episodes.iter().position(|e| e.ep_id == Some(*ep_id)) {
-                        let ep = &episodes[idx];
-                        let ep_title = ep.long_title.as_ref()
-                            .or(ep.title.as_ref())
-                            .map(|s| s.as_str())
-                            .unwrap_or("未知标题");
-                        let short_title = ep.title.as_ref().map(|s| s.as_str()).unwrap_or("");
-                        println!("{} {}", term::paint("番剧:", term::Style::Label), season_title);
-                        println!("  [{}] ep{} {} - {}\n", idx + 1, ep_id, short_title, ep_title);
-                    } else {
-                        println!("{} {} - {} {}\n", term::paint("番剧:", term::Style::Label), season_title, title, term::paint(format!("(ep={})", ep_id), term::Style::Dim));
-                    }
-                }
-            }
-
-            let (aid, cid) = match &resolved {
-                resolve::Resolved::Pub { aid, cid, .. } => (*aid, *cid),
-                resolve::Resolved::Pgc { aid, cid, .. } => (*aid, *cid),
-            };
-            let dash = match resolved {
-                resolve::Resolved::Pub { .. } => playurl::fetch_dash_ugc(&client, aid, cid, is_logged_in).await?,
-                resolve::Resolved::Pgc { ep_id, season_id, .. } => playurl::fetch_dash_pgc(&client, ep_id, season_id, is_logged_in).await?,
-            };
-
-            // 显示所有视频流
-            if !dash.video.is_empty() {
-                println!("{}", term::paint("可用视频流:", term::Style::Title));
-                for (i, v) in dash.video.iter().enumerate() {
-                    println!("  [v{}] qn={} codec={:?} bw={:?} size={}x{}",
-                        i,
-                        v.id,
-                        v.codecid,
-                        v.bandwidth,
-                        v.width.unwrap_or(0),
-                        v.height.unwrap_or(0)
-                    );
-                    let mut urls = vec![v.base_url.clone()];
-                    if let Some(backup) = &v.backup_url {
-                        urls.extend(backup.clone());
-                    }
-                    let filtered_urls = select::url_filter(urls);
-                    for (j, url) in filtered_urls.iter().enumerate() {
-                        println!("      [{}] {}", j, term::paint(url, term::Style::Dim));
-                    }
-                }
-                println!();
+    match do_search(&data.client, keyword.unwrap(), &data.public_base).await {
+        Ok(items) => HttpResponse::Ok().json(ApiResult {
+            code: 0,
+            success: true,
+            message: String::new(),
+            data: items,
+        }),
+        Err(e) => {
+            log::error!("search error: {e:?}");
+            let (code, msg) = map_error_code(&e);
+            let status_code = if code == -412 {
+                actix_web::http::StatusCode::PRECONDITION_FAILED
             } else {
-                println!("{}\n", term::paint("无可用视频流", term::Style::Warn));
-            }
-
-            // 显示所有音频流
-            if !dash.audio.is_empty() {
-                println!("{}", term::paint("可用音频流:", term::Style::Title));
-                for (i, a) in dash.audio.iter().enumerate() {
-                    println!("  [a{}] id={} codec={:?} bw={:?}",
-                        i,
-                        a.id,
-                        a.codecs,
-                        a.bandwidth
-                    );
-                    let mut urls = vec![a.base_url.clone()];
-                    if let Some(backup) = &a.backup_url {
-                        urls.extend(backup.clone());
-                    }
-                    let filtered_urls = select::url_filter(urls);
-                    for (j, url) in filtered_urls.iter().enumerate() {
-                        println!("      [{}] {}", j, term::paint(url, term::Style::Dim));
-                    }
-                }
-                println!();
-            } else {
-                println!("{}\n", term::paint("无可用音频流", term::Style::Warn));
-            }
-
-            // 显示最佳选择
-            let vbest = select::select_best_video(&dash.video);
-            let abest = select::select_best_audio(&dash.audio);
-            if vbest.is_some() && abest.is_some() {
-                let v_idx = dash.video.iter().position(|v| std::ptr::eq(v, vbest.unwrap())).unwrap_or(0);
-                let a_idx = dash.audio.iter().position(|a| std::ptr::eq(a, abest.unwrap())).unwrap_or(0);
-                println!("{} 视频=[v{}] 音频=[a{}]", term::paint("最佳选择:", term::Style::Ok), v_idx, a_idx);
-            }
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+            };
+            HttpResponse::build(status_code).json(ApiResult {
+                code,
+                success: false,
+                message: msg,
+                data: Vec::<SearchItem>::new(),
+            })
         }
-        "download" => {
-            if args.is_empty() {
-                return Err(anyhow!("缺少 <id|url>"));
-            }
-
-            // 解析 --ep 参数（用户输入从 1 开始，需要转换为从 0 开始的索引）
-            let ep_index = args.iter().position(|s| s == "--ep")
-                .and_then(|pos| args.get(pos + 1))
-                .and_then(|s| s.parse::<usize>().ok())
-                .and_then(|n| n.checked_sub(1));
-
-            let input = &args[0];
-            let resolved = resolve::resolve_input_with_ep(&client, input, ep_index).await?;
-
-            // 检查是否为未指定集数的番剧
-            if let resolve::Resolved::Pgc { ep_id: 0, season_title, episodes, .. } = &resolved {
-                eprintln!("{} 番剧 '{}' 需要指定集数", term::paint("错误:", term::Style::Err), season_title);
-                eprintln!("共 {} 集，请使用 --ep N 参数指定（N 从 1 开始）", episodes.len());
-                return Ok(());
-            }
-            
-            let (aid, cid, title) = match &resolved {
-                resolve::Resolved::Pub { aid, cid, title, .. } => (*aid, *cid, title.clone()),
-                resolve::Resolved::Pgc { aid, cid, title, .. } => (*aid, *cid, title.clone()),
-            };
-            let dash = match resolved {
-                resolve::Resolved::Pub { .. } => playurl::fetch_dash_ugc(&client, aid, cid, is_logged_in).await?,
-                resolve::Resolved::Pgc { ep_id, season_id, .. } => playurl::fetch_dash_pgc(&client, ep_id, season_id, is_logged_in).await?,
-            };
-            let vbest = select::select_best_video(&dash.video).ok_or_else(|| anyhow!("没有可用视频流"))?;
-            let abest = select::select_best_audio(&dash.audio).ok_or_else(|| anyhow!("没有可用音频流"))?;
-            // 生成下载 URL 列表（做一次过滤）
-            let mut vurls = vec![vbest.base_url.clone()];
-            if let Some(b) = &vbest.backup_url {
-                vurls.extend(b.clone());
-            }
-            let mut aurls = vec![abest.base_url.clone()];
-            if let Some(b) = &abest.backup_url {
-                aurls.extend(b.clone());
-            }
-            let vurls = select::url_filter(vurls);
-            let aurls = select::url_filter(aurls);
-            // 生成保存路径（根据 UGC/PGC 使用不同模板）
-            let (vpath, apath, hint_out_path) = match &resolved {
-                resolve::Resolved::Pub { bvid, .. } => {
-                    let base = config::render_storage_path_for_ugc(&title, bvid, aid, cid);
-                    let parent = base.parent().unwrap_or_else(|| std::path::Path::new("."));
-                    std::fs::create_dir_all(parent).ok();
-                    let stem = base.file_name().and_then(|s| s.to_str()).unwrap_or("bili").to_string();
-                    let v = parent.join(format!("{}-video.m4s", stem));
-                    let a = parent.join(format!("{}-audio.m4s", stem));
-                    let out = config::render_stream_output_from_base(&base);
-                    (v, a, out)
-                }
-                resolve::Resolved::Pgc { season_title, episodes, ep_id, .. } => {
-                    // 找到当前 ep 的索引（用于 {ep} 变量）
-                    let ep_index = episodes.iter().position(|e| e.ep_id == Some(*ep_id)).map(|i| i + 1).unwrap_or(1);
-                    let base = config::render_storage_path_for_pgc(season_title, &title, ep_index, *ep_id, aid, cid);
-                    let parent = base.parent().unwrap_or_else(|| std::path::Path::new("."));
-                    std::fs::create_dir_all(parent).ok();
-                    let stem = base.file_name().and_then(|s| s.to_str()).unwrap_or("bili").to_string();
-                    let v = parent.join(format!("{}-video.m4s", stem));
-                    let a = parent.join(format!("{}-audio.m4s", stem));
-                    let out = config::render_stream_output_from_base(&base);
-                    (v, a, out)
-                }
-            };
-            // 下载（按 URL 优先级尝试）
-            println!("{} 下载视频中...", term::paint("[1/2]", term::Style::Info));
-            download_with_priority(&client, vurls, &vpath).await?;
-            println!("{} 下载音频中...", term::paint("[2/2]", term::Style::Info));
-            download_with_priority(&client, aurls, &apath).await?;
-            println!("{}\n  {}\n  {}", term::paint("下载完成:", term::Style::Ok), vpath.display(), apath.display());
-
-            // 获取封面（内存中，不落盘）
-            let cover_bytes_opt: Option<Vec<u8>> = match cover::fetch_cover_url(&client, &resolved).await {
-                Some(cu) => cover::download_cover_bytes(&client, &cu).await,
-                None => None,
-            };
-
-            // 自动合流为最终文件，并附加封面（如有）
-            println!("{} 自动合流中...", term::paint("[合流]", term::Style::Info));
-            if let Err(e) = mux::mux_files_to_mp4_with_cover_bytes(&vpath, &apath, cover_bytes_opt.as_deref(), &hint_out_path).await {
-                eprintln!("{} 合流失败：{}", term::paint("错误:", term::Style::Err), e);
-                eprintln!("{} 你可以手动合流： ffmpeg -i \"{}\" -i \"{}\" -c copy \"{}\"", term::paint("提示:", term::Style::Label), vpath.display(), apath.display(), hint_out_path.display());
-            } else {
-                println!("{} {}", term::paint("合流完成:", term::Style::Ok), hint_out_path.display());
-            }
-        }
-        "stream" => {
-            if args.is_empty() {
-                return Err(anyhow!("缺少 <id|url>"));
-            }
-
-            // 解析 --ep 参数
-            let ep_index = args.iter().position(|s| s == "--ep")
-                .and_then(|pos| args.get(pos + 1))
-                .and_then(|s| s.parse::<usize>().ok())
-                .and_then(|n| n.checked_sub(1));
-
-            let input = &args[0];
-            let resolved = resolve::resolve_input_with_ep(&client, input, ep_index).await?;
-
-            // 检查是否为未指定集数的番剧
-            if let resolve::Resolved::Pgc { ep_id: 0, season_title, episodes, .. } = &resolved {
-                eprintln!("{} 番剧 '{}' 需要指定集数", term::paint("错误:", term::Style::Err), season_title);
-                eprintln!("共 {} 集，请使用 --ep N 参数指定（N 从 1 开始）", episodes.len());
-                return Ok(());
-            }
-
-            let (aid, cid, title) = match &resolved {
-                resolve::Resolved::Pub { aid, cid, title, .. } => (*aid, *cid, title.clone()),
-                resolve::Resolved::Pgc { aid, cid, title, .. } => (*aid, *cid, title.clone()),
-            };
-            let dash = match resolved {
-                resolve::Resolved::Pub { .. } => playurl::fetch_dash_ugc(&client, aid, cid, is_logged_in).await?,
-                resolve::Resolved::Pgc { ep_id, season_id, .. } => playurl::fetch_dash_pgc(&client, ep_id, season_id, is_logged_in).await?,
-            };
-            let vbest = select::select_best_video(&dash.video).ok_or_else(|| anyhow!("没有可用视频流"))?;
-            let abest = select::select_best_audio(&dash.audio).ok_or_else(|| anyhow!("没有可用音频流"))?;
-
-            // 生成下载 URL 列表（做一次过滤）
-            let mut vurls = vec![vbest.base_url.clone()];
-            if let Some(b) = &vbest.backup_url { vurls.extend(b.clone()); }
-            let mut aurls = vec![abest.base_url.clone()];
-            if let Some(b) = &abest.backup_url { aurls.extend(b.clone()); }
-            let vurls = select::url_filter(vurls);
-            let aurls = select::url_filter(aurls);
-
-            // 输出文件名（根据 UGC/PGC 模板生成，并使用配置的后缀与扩展名）
-            let out = match &resolved {
-                resolve::Resolved::Pub { bvid, .. } => {
-                    let base = config::render_storage_path_for_ugc(&title, bvid, aid, cid);
-                    let parent = base.parent().unwrap_or_else(|| std::path::Path::new("."));
-                    std::fs::create_dir_all(parent).ok();
-                    config::render_stream_output_from_base(&base)
-                }
-                resolve::Resolved::Pgc { season_title, episodes, ep_id, .. } => {
-                    let ep_index = episodes.iter().position(|e| e.ep_id == Some(*ep_id)).map(|i| i + 1).unwrap_or(1);
-                    let base = config::render_storage_path_for_pgc(season_title, &title, ep_index, *ep_id, aid, cid);
-                    let parent = base.parent().unwrap_or_else(|| std::path::Path::new("."));
-                    std::fs::create_dir_all(parent).ok();
-                    config::render_stream_output_from_base(&base)
-                }
-            };
-
-            println!("{} 通过 ffmpeg 流式合流中...", term::paint("[1/1]", term::Style::Info));
-
-            // 按优先级尝试组合
-            let mut last_err: Option<anyhow::Error> = None;
-            'outer: for vu in &vurls {
-                for au in &aurls {
-                    match mux::mux_streams_to_mp4(vu, au, &out).await {
-                        Ok(()) => { last_err = None; break 'outer; }
-                        Err(e) => { last_err = Some(e); }
-                    }
-                }
-            }
-
-            if let Some(e) = last_err {
-                return Err(anyhow!(format!("合流失败：{}", e)));
-            }
-
-            println!("{} {}", term::paint("合流完成:", term::Style::Ok), out.display());
-        }
-        _ => print_usage(),
     }
+}
 
+pub struct AppState {
+    client: Client,
+    public_base: String,
+}
+
+fn map_error_code(err: &anyhow::Error) -> (i32, String) {
+    let s = format!("{err:#}");
+    if s.contains("status=412") || s.contains("code=-412") {
+        return (-412, "请求被拦截(需要有效 Cookie)".into());
+    }
+    if s.contains("解析JSON失败") {
+        return (1001, "上游返回非 JSON".into());
+    }
+    (500, s.lines().next().unwrap_or("内部错误").to_string())
+}
+
+async fn do_search(client: &Client, keyword: &str, public_base: &str) -> Result<Vec<SearchItem>> {
+    let raw = search::search_media_bangumi(client, keyword).await?;
+    // 针对每个 season_id 获取详情（做简单并发限制）
+    use futures::stream::{self, StreamExt};
+    const CONCURRENCY: usize = 5;
+    let items: Vec<SearchItem> = stream::iter(raw.into_iter())
+        .map(|r| async move {
+            let id = r.season_id;
+            let detail = fetch_season_detail(client, id).await;
+            let (cover, desc, year, status, type_name) = match detail {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("season detail error season_id={} err={}", id, e);
+                    (
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::from("TV"),
+                    )
+                }
+            };
+            SearchItem {
+                id: id.to_string(),
+                title: r.title,
+                cover,
+                description: desc,
+                year,
+                status,
+                type_field: type_name,
+                url: format!("{}/detail/{}", public_base.trim_end_matches('/'), id),
+            }
+        })
+        .buffer_unordered(CONCURRENCY)
+        .collect()
+        .await;
+    Ok(items)
+}
+
+#[get("/detail/{id}")]
+async fn detail_endpoint(path: web::Path<(String,)>, data: web::Data<AppState>) -> impl Responder {
+    let season_id_str = path.into_inner().0;
+    let season_id: i64 = match season_id_str.parse() {
+        Ok(v) => v,
+        Err(_) => {
+            return HttpResponse::BadRequest().json(ApiResult {
+                code: 400,
+                success: false,
+                message: "id 参数应为数字".into(),
+                data: serde_json::json!({}),
+            });
+        }
+    };
+    match fetch_season_full(&data.client, season_id, &data.public_base).await {
+        Ok(detail) => HttpResponse::Ok().json(ApiResult {
+            code: 0,
+            success: true,
+            message: String::new(),
+            data: detail,
+        }),
+        Err(e) => {
+            log::error!("detail error id={} err={e:#}", season_id);
+            let (code, msg) = map_error_code(&e);
+            let status_code = if code == -412 {
+                actix_web::http::StatusCode::PRECONDITION_FAILED
+            } else if code == 404 {
+                actix_web::http::StatusCode::NOT_FOUND
+            } else {
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+            };
+            HttpResponse::build(status_code).json(ApiResult {
+                code,
+                success: false,
+                message: msg,
+                data: serde_json::json!({}),
+            })
+        }
+    }
+}
+
+async fn fetch_season_detail(
+    client: &Client,
+    season_id: i64,
+) -> Result<(String, String, String, String, String)> {
+    let mut url = reqwest::Url::parse("https://api.bilibili.com/pgc/view/web/season")?;
+    url.query_pairs_mut()
+        .append_pair("season_id", &season_id.to_string());
+    let resp = client
+        .get(url)
+        .header("Referer", "https://www.bilibili.com")
+        .send()
+        .await?;
+    let status = resp.status();
+    let text = resp.text().await?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| {
+        anyhow::anyhow!(
+            "season detail parse fail id={} status={} err={} body_snip={}",
+            season_id,
+            status,
+            e,
+            &text.chars().take(120).collect::<String>()
+        )
+    })?;
+    let root = v
+        .get("result")
+        .or_else(|| v.get("data"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let cover = root
+        .get("cover")
+        .or_else(|| root.get("season_cover"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let desc = root
+        .get("evaluate")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let publish_time = root
+        .get("publish")
+        .and_then(|p| p.get("pub_time"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
+    let year = if publish_time.len() >= 4 {
+        publish_time[..4].to_string()
+    } else {
+        String::new()
+    };
+    let is_finish = root
+        .get("publish")
+        .and_then(|p| p.get("is_finish"))
+        .and_then(|b| b.as_i64())
+        .unwrap_or(0)
+        == 1;
+    let status = if is_finish { "完结" } else { "连载" }.to_string();
+    let type_name = root
+        .get("season_type_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("TV")
+        .to_string();
+    Ok((cover, desc, year, status, type_name))
+}
+
+async fn fetch_season_full(
+    client: &Client,
+    season_id: i64,
+    public_base: &str,
+) -> Result<DetailData> {
+    let mut url = reqwest::Url::parse("https://api.bilibili.com/pgc/view/web/season")?;
+    url.query_pairs_mut()
+        .append_pair("season_id", &season_id.to_string());
+    let resp = client
+        .get(url)
+        .header("Referer", "https://www.bilibili.com")
+        .send()
+        .await?;
+    let status = resp.status();
+    let text = resp.text().await?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| {
+        anyhow::anyhow!(
+            "season detail parse fail id={} status={} err={} body_snip={}",
+            season_id,
+            status,
+            e,
+            &text.chars().take(160).collect::<String>()
+        )
+    })?;
+    // 统一 root: 有的返回 result，有的返回 data
+    let root = v
+        .get("result")
+        .or_else(|| v.get("data"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    if root.is_null() {
+        return Err(anyhow::anyhow!("season not found id={}", season_id));
+    }
+    let title = root
+        .get("title")
+        .or_else(|| root.get("season_title"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if title.is_empty() {
+        return Err(anyhow::anyhow!("title empty id={}", season_id));
+    }
+    let cover = root
+        .get("cover")
+        .or_else(|| root.get("season_cover"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let desc = root
+        .get("evaluate")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let publish_time = root
+        .get("publish")
+        .and_then(|p| p.get("pub_time"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
+    let year = if publish_time.len() >= 4 {
+        publish_time[..4].to_string()
+    } else {
+        String::new()
+    };
+    let is_finish = root
+        .get("publish")
+        .and_then(|p| p.get("is_finish"))
+        .and_then(|b| b.as_i64())
+        .unwrap_or(0)
+        == 1;
+    let status = if is_finish { "完结" } else { "连载" }.to_string();
+    let type_name = root
+        .get("season_type_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("TV")
+        .to_string();
+    let eps_arr = root
+        .get("episodes")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut sources: Vec<DetailSourceItem> = Vec::with_capacity(eps_arr.len());
+    for (idx, ep) in eps_arr.iter().enumerate() {
+        let ep_index = idx + 1; // 1-based
+        let ep_title_num = ep.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let ep_long = ep.get("long_title").and_then(|v| v.as_str()).unwrap_or("");
+        let name = if ep_long.is_empty() {
+            if ep_title_num.is_empty() {
+                format!("第{}集", ep_index)
+            } else {
+                format!("第{}集", ep_title_num)
+            }
+        } else {
+            if ep_title_num.is_empty() {
+                format!("第{}集 {}", ep_index, ep_long)
+            } else {
+                format!("第{}集 {}", ep_title_num, ep_long)
+            }
+        };
+        sources.push(DetailSourceItem {
+            name,
+            sort: ep_index,
+            url: format!(
+                "{}/play/{}/{}",
+                public_base.trim_end_matches('/'),
+                season_id,
+                ep_index
+            ),
+        });
+    }
+    Ok(DetailData {
+        id: season_id.to_string(),
+        title,
+        cover,
+        description: desc,
+        year,
+        status,
+        type_field: type_name,
+        sources,
+    })
+}
+
+#[actix_web::main]
+async fn main() -> anyhow::Result<()> {
+    let cfg = config::get();
+    let bind_addr = cfg.api.bind.clone();
+    let public_base = cfg.api.public_base.clone();
+    let (client, _store) =
+        cookies::build_client(cookies::load_cookie_store().context("load cookies")?)
+            .expect("build client with cookies");
+    // Initialize logging with default filter if RUST_LOG is not set.
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info,actix_web=info,selfani=info"),
+    )
+    .init();
+    log::info!("Starting server at http://{}", bind_addr);
+    HttpServer::new(move || {
+        App::new()
+            .wrap(ActixLogger::default())
+            .wrap(
+                Cors::default()
+                    .allow_any_origin()
+                    .allowed_methods(vec!["GET", "OPTIONS", "HEAD"])
+                    .allowed_header(actix_web::http::header::CONTENT_TYPE)
+                    .allowed_header(actix_web::http::header::RANGE)
+                    .expose_headers(vec!["Content-Length", "Accept-Ranges"])
+                    .max_age(86400),
+            )
+            .app_data(web::Data::new(AppState {
+                client: client.clone(),
+                public_base: public_base.clone(),
+            }))
+            .service(search_endpoint)
+            .service(detail_endpoint)
+            .service(hls::hls_playlist)
+            .service(hls::hls_segment)
+    })
+    .bind(bind_addr)?
+    .run()
+    .await?;
     Ok(())
-}
-
-async fn download_with_priority(client: &reqwest::Client, urls: Vec<String>, path: &Path) -> Result<()> {
-    for u in urls { if let Ok(()) = download::download_to_file(client, &u, path).await { return Ok(()); } }
-    Err(anyhow!("所有 URL 均下载失败"))
 }

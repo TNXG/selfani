@@ -1,8 +1,8 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use reqwest::Client;
 use reqwest_cookie_store::{CookieStore, CookieStoreMutex};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write, Read};
+use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -11,7 +11,11 @@ fn cookie_path() -> PathBuf {
     let p = &cfg.cookies.path;
     let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let path = PathBuf::from(p);
-    if path.is_absolute() { path } else { base.join(path) }
+    if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    }
 }
 
 pub fn load_cookie_store() -> Result<CookieStore> {
@@ -42,16 +46,6 @@ pub fn load_cookie_store() -> Result<CookieStore> {
     }
 }
 
-pub fn save_cookie_store(store: &CookieStore) -> Result<()> {
-    let path = cookie_path();
-    let f = File::create(&path).context("创建 cookies.json 失败")?;
-    let mut writer = BufWriter::new(f);
-    cookie_store::serde::json::save(store, &mut writer)
-        .map_err(|e| anyhow!(e.to_string()))?;
-    writer.flush()?;
-    Ok(())
-}
-
 pub fn build_client(store: CookieStore) -> Result<(Client, Arc<CookieStoreMutex>)> {
     let cookie_store = Arc::new(CookieStoreMutex::new(store));
     let client = Client::builder()
@@ -60,11 +54,4 @@ pub fn build_client(store: CookieStore) -> Result<(Client, Arc<CookieStoreMutex>
         .redirect(reqwest::redirect::Policy::limited(10))
         .build()?;
     Ok((client, cookie_store))
-}
-
-/// 检测用户是否已登录（通过检查是否有 SESSDATA cookie）
-pub fn is_logged_in(store: &CookieStore) -> bool {
-    let url = "https://www.bilibili.com".parse::<reqwest::Url>().unwrap();
-    let cookies = store.matches(&url);
-    cookies.iter().any(|cookie| cookie.name() == "SESSDATA" && !cookie.value().is_empty())
 }
