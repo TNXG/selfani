@@ -2,30 +2,10 @@
 
 # 预留的 API 配置（暂时留空，后续使用）
 [api]
-bind = "127.0.0.1:8080"
-public_base = "http://127.0.0.1:8080"
+bind = "0.0.0.0:8080"
+public_base = "http://192.168.3.3:8080"
 enable_cache = true
 cache_dir = "cache"
-
-# 存储配置：用于组织文件保存目录/文件名
-[storage]
-# 基础保存目录（相对或绝对路径）
-base_dir = "data"
-# 番剧（PGC）命名模板：可用变量 {season_title} {title} {ep} {ep_id} {cid} {aid}
-# - {season_title}: 作品名称
-# - {title}: 集标题
-# - {ep}: 集数（从 1 开始）
-# - {ep_id}: 集数 ID（B站 epId）
-# - {cid}: cid
-# - {aid}: aid
-pgc_template = "{season_title}/[{ep}]{title}"
-# UGC（普通视频）命名模板：可用变量 {title} {bvid} {cid} {aid}
-ugc_template = "{title}"
-
-# 流式合流或最终输出的后缀与扩展名（可按需修改）
-# 例如合流输出会是 "{模板}{stream_suffix}.{stream_ext}"
-stream_suffix = ""
-stream_ext = "mp4"
 
 # Cookies 配置
 [cookies]

@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, anyhow};
 use reqwest::Client;
 use reqwest_cookie_store::{CookieStore, CookieStoreMutex};
-use std::fs::File;
-use std::io::{BufReader, Read};
+use std::fs::{File, create_dir_all};
+use std::io::{BufReader, BufWriter, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,6 +16,24 @@ fn cookie_path() -> PathBuf {
     } else {
         base.join(path)
     }
+}
+
+/// 对外暴露 cookie 文件是否存在的检查，用于首次启动判断。
+pub fn cookie_file_exists() -> bool {
+    cookie_path().exists()
+}
+
+/// 保存当前 CookieStore 到文件（采用新版 serde json 格式）。
+pub fn save_cookie_store(store: &CookieStore) -> Result<()> {
+    let path = cookie_path();
+    if let Some(parent) = path.parent() {
+        if !parent.exists() {
+            create_dir_all(parent)?;
+        }
+    }
+    let f = File::create(&path).context("创建 cookies 文件失败")?;
+    let mut writer = BufWriter::new(f);
+    cookie_store::serde::json::save(store, &mut writer).map_err(|e| anyhow!(e.to_string()))
 }
 
 pub fn load_cookie_store() -> Result<CookieStore> {

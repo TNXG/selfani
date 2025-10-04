@@ -17,7 +17,7 @@ serde_json = "1.0.145"
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util"] }
 reqwest = { version = "0.12.23", features = ["json", "gzip", "brotli", "deflate", "rustls-tls", "cookies"] }
 reqwest_cookie_store = "0.9.0"
-cookie_store = "0.22.0"
+cookie_store = { version = "0.22.0", features = ["serde"] }
 regex = "1.11.3"
 url = "2.5.7"
 md5 = "0.8.0"
@@ -29,5 +29,5 @@ actix-cors = "0.7.1"
 futures = "0.3.31"
 log = "0.4.28"
 env_logger = "0.11.8"
-# libc = "0.2.176"  # 不再需要 FIFO
-# rand = "0.9.2"  # 不再需要随机文件名
+qrcode = "0.14.1"
+indicatif = "0.18.0"

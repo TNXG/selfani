@@ -1,13 +1,14 @@
 mod config;
 mod cookies;
+mod hls;
+mod login;
 mod playurl;
 mod search;
 mod wbi;
-mod hls;
 
-use actix_web::{App, HttpResponse, HttpServer, Responder, get, web};
-use actix_web::middleware::Logger as ActixLogger;
 use actix_cors::Cors;
+use actix_web::middleware::Logger as ActixLogger;
+use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, get, web};
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Serialize;
@@ -38,7 +39,7 @@ struct SearchItem {
 struct DetailSourceItem {
     name: String,
     sort: usize,
-    url: String,
+    m3u8: String,
 }
 
 #[derive(Serialize)]
@@ -68,7 +69,11 @@ async fn search_endpoint(
             data: Vec::<SearchItem>::new(),
         });
     }
-    match do_search(&data.client, keyword.unwrap(), &data.public_base).await {
+    let html_mode = q
+        .get("f")
+        .map(|v| v.eq_ignore_ascii_case("html"))
+        .unwrap_or(false);
+    match do_search(&data.client, keyword.unwrap(), &data.public_base, html_mode).await {
         Ok(items) => HttpResponse::Ok().json(ApiResult {
             code: 0,
             success: true,
@@ -109,7 +114,12 @@ fn map_error_code(err: &anyhow::Error) -> (i32, String) {
     (500, s.lines().next().unwrap_or("内部错误").to_string())
 }
 
-async fn do_search(client: &Client, keyword: &str, public_base: &str) -> Result<Vec<SearchItem>> {
+async fn do_search(
+    client: &Client,
+    keyword: &str,
+    public_base: &str,
+    html_mode: bool,
+) -> Result<Vec<SearchItem>> {
     let raw = search::search_media_bangumi(client, keyword).await?;
     // 针对每个 season_id 获取详情（做简单并发限制）
     use futures::stream::{self, StreamExt};
@@ -131,6 +141,12 @@ async fn do_search(client: &Client, keyword: &str, public_base: &str) -> Result<
                     )
                 }
             };
+            let base = public_base.trim_end_matches('/');
+            let url = if html_mode {
+                format!("{}/html/{}", base, id)
+            } else {
+                format!("{}/detail/{}", base, id)
+            };
             SearchItem {
                 id: id.to_string(),
                 title: r.title,
@@ -139,7 +155,7 @@ async fn do_search(client: &Client, keyword: &str, public_base: &str) -> Result<
                 year,
                 status,
                 type_field: type_name,
-                url: format!("{}/detail/{}", public_base.trim_end_matches('/'), id),
+                url,
             }
         })
         .buffer_unordered(CONCURRENCY)
@@ -187,6 +203,112 @@ async fn detail_endpoint(path: web::Path<(String,)>, data: web::Data<AppState>) 
             })
         }
     }
+}
+
+#[get("/html/{id}")]
+async fn html_endpoint(
+    path: web::Path<(String,)>,
+    data: web::Data<AppState>,
+    req: HttpRequest,
+) -> impl Responder {
+    let season_id_str = path.into_inner().0;
+    let season_id: i64 = match season_id_str.parse() {
+        Ok(v) => v,
+        Err(_) => {
+            return HttpResponse::BadRequest()
+                .insert_header(("Content-Type", "text/plain; charset=utf-8"))
+                .body("id 参数应为数字");
+        }
+    };
+    // 复用 fetch_season_full 获取 episodes
+    match fetch_season_full(&data.client, season_id, &data.public_base).await {
+        Ok(detail) => {
+            // 仅保留现有线路，命名为 “星源通道”
+            let base_host = req.connection_info().host().to_string();
+            let scheme = if req.connection_info().scheme() == "https" {
+                "https"
+            } else {
+                "http"
+            };
+            let line_base = if data.public_base.starts_with("http://")
+                || data.public_base.starts_with("https://")
+            {
+                data.public_base.trim_end_matches('/').to_string()
+            } else {
+                format!("{}://{}", scheme, base_host)
+            };
+            let mut panel = String::new();
+            for s in &detail.sources {
+                let rel = format!("/hls/{}/{}/index.m3u8", detail.id, s.sort);
+                let name_escaped = html_escape(&s.name);
+                panel.push_str(&format!(
+                    "      <a href=\"{base}{rel}\">{name}</a>\n",
+                    base = line_base,
+                    rel = rel,
+                    name = name_escaped
+                ));
+            }
+            let page = format!(
+                r#"<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>{title}</title>
+</head>
+<body>
+  <h1>{title}</h1>
+  <!-- 单一路线标签 -->
+  <div class="channel-tabs">
+    <a>星源通道</a>
+  </div>
+  <!-- 剧集列表 -->
+  <div class="episode-panels">
+    <div class="panel">
+{panel}    
+</div>
+  </div>
+</body>
+</html>"#,
+                title = html_escape(&detail.title),
+                panel = panel,
+            );
+            HttpResponse::Ok()
+                .insert_header(("Content-Type", "text/html; charset=utf-8"))
+                .body(page)
+        }
+        Err(e) => {
+            log::error!("html detail error id={} err={e:#}", season_id);
+            let (code, msg) = map_error_code(&e);
+            let status_code = if code == -412 {
+                actix_web::http::StatusCode::PRECONDITION_FAILED
+            } else if code == 404 {
+                actix_web::http::StatusCode::NOT_FOUND
+            } else {
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+            };
+            HttpResponse::build(status_code)
+                .insert_header(("Content-Type", "text/plain; charset=utf-8"))
+                .body(format!("获取剧集失败: {}", msg))
+        }
+    }
+}
+
+// 简单 HTML 转义（最少需求）
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+// 直接映射静态 provide.json 内容（打包进二进制）
+const PROVIDE_JSON_TEXT: &str = include_str!("provide.json");
+
+#[get("/")]
+async fn provide_endpoint() -> impl Responder {
+    HttpResponse::Ok()
+        .insert_header(("Content-Type", "application/json; charset=utf-8"))
+        .body(PROVIDE_JSON_TEXT)
 }
 
 async fn fetch_season_detail(
@@ -354,8 +476,8 @@ async fn fetch_season_full(
         sources.push(DetailSourceItem {
             name,
             sort: ep_index,
-            url: format!(
-                "{}/play/{}/{}",
+            m3u8: format!(
+                "{}/hls/{}/{}/index.m3u8",
                 public_base.trim_end_matches('/'),
                 season_id,
                 ep_index
@@ -379,10 +501,33 @@ async fn main() -> anyhow::Result<()> {
     let cfg = config::get();
     let bind_addr = cfg.api.bind.clone();
     let public_base = cfg.api.public_base.clone();
-    let (client, _store) =
-        cookies::build_client(cookies::load_cookie_store().context("load cookies")?)
-            .expect("build client with cookies");
-    // Initialize logging with default filter if RUST_LOG is not set.
+    // 载入（或创建空） cookie store
+    let cookie_existed = cookies::cookie_file_exists();
+    let store = cookies::load_cookie_store().context("load cookies")?;
+    let (client, store_mutex) = cookies::build_client(store).expect("build client with cookies");
+
+    // 若首次启动没有 cookie 文件，则进行一次扫码登录
+    if !cookie_existed {
+        println!("检测到首次启动（未找到 cookies 文件），需要扫码登录以获取必要的凭据。");
+        match login::login_qr(&client).await {
+            Ok(()) => {
+                // 登录成功后保存 cookies
+                if let Ok(guard) = store_mutex.lock() {
+                    if let Err(e) = cookies::save_cookie_store(&guard) {
+                        eprintln!("保存 cookies 失败: {e:#}");
+                    } else {
+                        println!("登录成功，cookies 已保存。");
+                    }
+                } else {
+                    eprintln!("无法获取 cookie 锁以保存 cookies。");
+                }
+            }
+            Err(e) => {
+                eprintln!("首次登录失败: {e:#}\n继续启动服务，但部分需要登录的接口可能受限。");
+            }
+        }
+    }
+
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info,actix_web=info,selfani=info"),
     )
@@ -406,6 +551,8 @@ async fn main() -> anyhow::Result<()> {
             }))
             .service(search_endpoint)
             .service(detail_endpoint)
+            .service(html_endpoint)
+            .service(provide_endpoint)
             .service(hls::hls_playlist)
             .service(hls::hls_segment)
     })
