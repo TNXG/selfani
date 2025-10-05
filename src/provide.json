@@ -9,10 +9,10 @@
                     "description": "自建动漫API",
                     "iconUrl": "https://www.tnxg.top/favicon.ico",
                     "searchConfig": {
-                        "searchUrl": "http://192.168.3.3:8080/search?f=html&q={keyword}",
+                        "searchUrl": "[config.api.public_base]/search?f=html&q={keyword}",
                         "searchUseOnlyFirstWord": false,
                         "searchRemoveSpecial": false,
-                        "rawBaseUrl": "http://192.168.3.3:8080",
+                        "rawBaseUrl": "[config.api.public_base]",
                         "subjectFormatId": "json-path-indexed",
                         "selectorSubjectFormatJsonPathIndexed": {
                             "selectNames": "$.data[*].title",

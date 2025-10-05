@@ -305,10 +305,20 @@ fn html_escape(s: &str) -> String {
 const PROVIDE_JSON_TEXT: &str = include_str!("provide.json");
 
 #[get("/")]
-async fn provide_endpoint() -> impl Responder {
+async fn provide_endpoint(data: web::Data<AppState>, req: HttpRequest) -> impl Responder {
+    // 计算对外可见的 base 地址
+    let base = if data.public_base.starts_with("http://") || data.public_base.starts_with("https://") {
+        data.public_base.trim_end_matches('/').to_string()
+    } else {
+        let host = req.connection_info().host().to_string();
+        let scheme = if req.connection_info().scheme() == "https" { "https" } else { "http" };
+        format!("{}://{}", scheme, host)
+    };
+    // 硬字符替代占位符
+    let body = PROVIDE_JSON_TEXT.replace("[config.api.public_base]", &base);
     HttpResponse::Ok()
         .insert_header(("Content-Type", "application/json; charset=utf-8"))
-        .body(PROVIDE_JSON_TEXT)
+        .body(body)
 }
 
 async fn fetch_season_detail(

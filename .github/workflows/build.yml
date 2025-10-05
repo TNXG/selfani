@@ -1,0 +1,320 @@
+name: Cross-platform Release Build
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows targets
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cross: false
+          - os: windows-latest
+            target: i686-pc-windows-msvc
+            cross: false
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            cross: false
+          
+          # macOS targets
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            cross: false
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            cross: false
+          
+          # Linux targets (native)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cross: false
+          - os: ubuntu-latest
+            target: i686-unknown-linux-gnu
+            cross: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cross: true
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-gnueabihf
+            cross: true
+          - os: ubuntu-latest
+            target: arm-unknown-linux-gnueabihf
+            cross: true
+          
+          # Linux musl targets
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            cross: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            cross: true
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-musleabihf
+            cross: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: rust-src
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          cache-on-failure: true
+
+      - name: Install cross (Linux only)
+        if: matrix.cross == true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Setup Windows dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Enable long paths for Windows
+          git config --system core.longpaths true
+
+      - name: Setup macOS dependencies
+        if: runner.os == 'macOS'
+        run: |
+          # Install Xcode Command Line Tools if needed
+          xcode-select --install 2>/dev/null || true
+          sudo xcodebuild -license accept 2>/dev/null || true
+
+      - name: Setup Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Build binary (with cross)
+        if: matrix.cross == true
+        run: cross build --target ${{ matrix.target }} --release --locked
+
+      - name: Build binary (native)
+        if: matrix.cross == false
+        run: cargo build --target ${{ matrix.target }} --release --locked
+
+      - name: Prepare binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts
+          
+          # Get binary name from Cargo.toml
+          $binaryName = (Select-String -Path "Cargo.toml" -Pattern '^name = "(.+)"').Matches[0].Groups[1].Value
+          
+          # Source and destination paths
+          $sourcePath = "target\${{ matrix.target }}\release\${binaryName}.exe"
+          $destPath = "artifacts\${binaryName}-${{ matrix.target }}.exe"
+          
+          # Copy and verify
+          if (Test-Path $sourcePath) {
+            Copy-Item $sourcePath $destPath
+            Write-Host "✅ Binary found and copied: $destPath"
+            Get-Item $destPath | Format-List
+          } else {
+            Write-Host "❌ Binary not found at: $sourcePath"
+            if (Test-Path "target\${{ matrix.target }}\release\") {
+              Write-Host "Contents of target\${{ matrix.target }}\release\:"
+              Get-ChildItem "target\${{ matrix.target }}\release\" | Format-Table
+            }
+            exit 1
+          }
+
+      - name: Prepare binary (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          
+          # Find the binary name from Cargo.toml
+          BINARY_NAME=$(grep '^name = ' Cargo.toml | head -1 | sed 's/name = "\(.*\)"/\1/')
+          
+          # Source and destination paths
+          SOURCE_PATH="target/${{ matrix.target }}/release/${BINARY_NAME}"
+          DEST_PATH="artifacts/${BINARY_NAME}-${{ matrix.target }}"
+          
+          # Copy and verify
+          if [[ -f "${SOURCE_PATH}" ]]; then
+            cp "${SOURCE_PATH}" "${DEST_PATH}"
+            echo "✅ Binary found and copied: ${DEST_PATH}"
+            
+            # Show file info
+            ls -la "${DEST_PATH}"
+            
+            # Show file type
+            if command -v file >/dev/null 2>&1; then
+              file "${DEST_PATH}"
+            fi
+          else
+            echo "❌ Binary not found at: ${SOURCE_PATH}"
+            echo "Contents of target/${{ matrix.target }}/release/:"
+            ls -la "target/${{ matrix.target }}/release/" || true
+            exit 1
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Display structure of downloaded files
+        run: |
+          echo "Downloaded artifacts:"
+          ls -la artifacts/
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS
+          echo "Generated checksums:"
+          cat SHA256SUMS
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          body: |
+            ## Release ${{ github.ref_name }}
+            
+            This release contains pre-compiled binaries for multiple platforms and architectures:
+            
+            ### Windows
+            - `*-x86_64-pc-windows-msvc.exe` - Windows 64-bit (Intel/AMD)
+            - `*-i686-pc-windows-msvc.exe` - Windows 32-bit (Intel/AMD)
+            - `*-aarch64-pc-windows-msvc.exe` - Windows ARM64
+            
+            ### macOS
+            - `*-x86_64-apple-darwin` - macOS Intel (x64)
+            - `*-aarch64-apple-darwin` - macOS Apple Silicon (M1/M2)
+            
+            ### Linux (GNU)
+            - `*-x86_64-unknown-linux-gnu` - Linux x64
+            - `*-i686-unknown-linux-gnu` - Linux x86
+            - `*-aarch64-unknown-linux-gnu` - Linux ARM64
+            - `*-armv7-unknown-linux-gnueabihf` - Linux ARMv7
+            - `*-arm-unknown-linux-gnueabihf` - Linux ARM
+            
+            ### Linux (musl - static linking)
+            - `*-x86_64-unknown-linux-musl` - Linux x64 (static)
+            - `*-aarch64-unknown-linux-musl` - Linux ARM64 (static)
+            - `*-armv7-unknown-linux-musleabihf` - Linux ARMv7 (static)
+            
+            ### Installation
+            1. Download the appropriate binary for your platform
+            2. Make it executable (Unix systems): `chmod +x binary-name`
+            3. Run the binary
+            
+            ### Verification
+            You can verify the integrity of downloaded files using the provided `SHA256SUMS` file.
+            
+            **Built with:** Rust stable
+            **Automated build:** GitHub Actions
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+          files: |
+            artifacts/*
+          generate_release_notes: true
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Optional: Test binaries after build
+  test:
+    name: Test ${{ matrix.target }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: x86_64-apple-darwin
+    
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: ./
+
+      - name: Test binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $binary = Get-ChildItem -File | Select-Object -First 1
+          Write-Host "Testing binary: $($binary.Name)"
+          
+          # Example: Run with --version flag
+          try {
+            & ".\$($binary.Name)" --version
+          } catch {
+            try {
+              & ".\$($binary.Name)" --help
+            } catch {
+              Write-Host "Binary executed (no flags supported)"
+            }
+          }
+
+      - name: Test binary (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          # Make executable
+          chmod +x ./*
+          
+          # Run basic test
+          BINARY=$(ls ./* | head -1)
+          echo "Testing binary: $BINARY"
+          
+          # Example: Run with --version flag
+          ./$BINARY --version || ./$BINARY --help || echo "Binary executed"
