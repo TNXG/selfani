@@ -2,6 +2,24 @@ use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::path::PathBuf;
 
+fn default_config_toml() -> &'static str {
+    r#"# SelfAni 配置文件 (自动生成)
+# 首次运行已为你生成默认配置，可按需修改后重启。
+
+[api]
+# 服务器监听地址
+bind = "127.0.0.1:8080"
+# 对外可访问的基础 URL（供接口内返回拼接使用，可改成公网或内网实际地址）
+public_base = "http://127.0.0.1:8080"
+# 缓存目录（部分接口可能用到）
+cache_dir = "cache"
+
+[cookies]
+# 登录 cookies 文件路径（程序会在扫码后写入）
+path = "cookies.jsonl"
+"#
+}
+
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct ApiConfig {
     /// 服务器绑定地址（例如 0.0.0.0:8080），默认 127.0.0.1:8080
@@ -78,6 +96,14 @@ pub static CONFIG: Lazy<Config> = Lazy::new(|| {
     let path = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join("config.toml");
+    // 若文件不存在，生成默认模板
+    if !path.exists() {
+        if let Err(e) = std::fs::write(&path, default_config_toml()) {
+            eprintln!("写入默认 config.toml 失败: {e:#}");
+        } else {
+            println!("已生成默认配置文件: {}", path.display());
+        }
+    }
     if let Ok(s) = std::fs::read_to_string(&path) {
         match toml::from_str::<Config>(&s) {
             Ok(mut cfg) => {
